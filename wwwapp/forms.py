@@ -603,7 +603,7 @@ class InvoiceForm(ModelForm):
             'description': 'Opis',
         }
         help_texts = {
-            'attachment': 'Załącz skan lub plik PDF dokumentu (PDF, JPG lub JPEG; maks. 50 MiB).',
+            'attachment': 'Załącz skan lub plik PDF dokumentu (PDF, JPG, JPEG lub PNG; maks. 50 MiB).',
             'document_number': 'Przepisz numer widoczny na fakturze lub rachunku.',
             'issue_date': 'Wybierz datę wystawienia widoczną na dokumencie.',
             'amount': 'Łączna kwota brutto dokumentu. Musi być równa sumie pozycji kosztowych.',
@@ -616,6 +616,8 @@ class InvoiceForm(ModelForm):
         super().__init__(*args, **kwargs)
         self.instance.user = user
         self.instance.camp = camp
+        if self.instance.internal_number:
+            self.fields['invoice_type'].disabled = True
         self.helper = FormHelper(self)
         self.helper.form_tag = False
         self.helper.include_media = False
@@ -626,7 +628,7 @@ class InvoiceForm(ModelForm):
             return attachment
 
         if not self._looks_like_supported_document(attachment):
-            raise ValidationError('Załącznik musi być plikiem PDF, JPG lub JPEG.')
+            raise ValidationError('Załącznik musi być plikiem PDF, JPG, JPEG lub PNG.')
         if attachment.size > self.MAX_ATTACHMENT_SIZE:
             raise ValidationError('Załącznik nie może być większy niż 50 MiB.')
         return attachment
@@ -639,7 +641,11 @@ class InvoiceForm(ModelForm):
             attachment.seek(0)
         except (OSError, ValueError):
             return False
-        return header.startswith(b'%PDF-') or header[:3] == b'\xff\xd8\xff'
+        return (
+            header.startswith(b'%PDF-')
+            or header[:3] == b'\xff\xd8\xff'
+            or header == b'\x89PNG\r\n\x1a\n'
+        )
 
 
 class CostItemForm(ModelForm):
@@ -682,7 +688,7 @@ class BaseCostItemInlineFormSet(BaseInlineFormSet):
 
     def clean(self):
         super().clean()
-        if any(self.errors):
+        if any(self.errors) or self.invoice_amount is None:
             return
 
         items = [
@@ -780,42 +786,6 @@ class ReimbursementForm(ModelForm):
             FormActions(
                 StrictButton('Zarejestruj zwrot', type='submit', css_class='btn-primary'),
             ),
-        )
-
-
-class FullNameUserChoiceField(ModelChoiceField):
-    """Render a user choice with the participant's full name."""
-
-    def label_from_instance(self, user):
-        return user.get_full_name()
-
-
-class CostFilterForm(Form):
-    """Provide optional invoice administration filters."""
-
-    user = FullNameUserChoiceField(label='Użytkownik', queryset=None, required=False)
-    status = ChoiceField(
-        label='Status',
-        choices=(('', 'Wszystkie'), *Invoice.Status.choices),
-        required=False,
-    )
-    invoice_type = ChoiceField(
-        label='Typ dokumentu',
-        choices=(('', 'Wszystkie'), *Invoice.Type.choices),
-        required=False,
-    )
-
-    def __init__(self, *args, users, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.fields['user'].queryset = users
-        self.helper = FormHelper(self)
-        self.helper.form_tag = False
-        self.helper.include_media = False
-        self.helper.layout = Layout(
-            'user',
-            'status',
-            'invoice_type',
-            FormActions(StrictButton('Filtruj', type='submit', css_class='btn-secondary')),
         )
 
 

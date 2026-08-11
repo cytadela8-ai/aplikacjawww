@@ -37,7 +37,6 @@ from django_sendfile import sendfile
 
 from wwwforms.models import Form, FormQuestionAnswer, FormQuestion
 from wwwapp.costs import (
-    allocate_invoice_number,
     approved_total_for,
     balance_for,
     invoice_csv_response,
@@ -48,7 +47,6 @@ from wwwapp.costs import (
 from wwwapp.forms import (
     ArticleForm,
     CampInterestEmailForm,
-    CostFilterForm,
     CostItemFormSet,
     InvoiceForm,
     ReimbursementForm,
@@ -131,7 +129,9 @@ def redirect_to_view_for_latest_year(target_view_name):
 @login_required
 def costs_mine_view(request, year):
     camp = get_object_or_404(Camp, pk=year)
-    invoices = Invoice.objects.filter(user=request.user, camp=camp).order_by('-created_at')
+    invoices = Invoice.objects.filter(user=request.user, camp=camp).prefetch_related(
+        'cost_items__workshop'
+    ).order_by('-created_at')
     settlement_details = settlement_details_for(user=request.user, camp=camp)
     saved_account_number = (
         settlement_details.account_number if settlement_details is not None else ''
@@ -214,9 +214,7 @@ def _invoice_form_view(request, *, year, invoice_id=None, admin_edit=False):
     if request.method == 'POST' and invoice_form_is_valid and formset.is_valid():
         old_attachment_name = invoice.attachment.name if invoice else ''
         invoice = invoice_form.save(commit=False)
-        if invoice_id is None:
-            invoice.internal_number = allocate_invoice_number(camp=camp)
-        else:
+        if invoice_id is not None:
             if admin_edit:
                 invoice.admin_modified_at = timezone.now()
                 invoice.admin_modified_by = request.user
@@ -228,7 +226,8 @@ def _invoice_form_view(request, *, year, invoice_id=None, admin_edit=False):
         uploaded_attachment = invoice_form.cleaned_data['attachment']
         if isinstance(uploaded_attachment, UploadedFile):
             _, extension = os.path.splitext(uploaded_attachment.name)
-            invoice.attachment.name = f'{invoice.internal_number}{extension.lower()}'
+            timestamp = timezone.now().strftime('%Y%m%d%H%M%S%f')
+            invoice.attachment.name = f'WWW_{camp.year}_{timestamp}{extension.lower()}'
         stored_attachment_name = ''
         try:
             with transaction.atomic():
@@ -270,32 +269,29 @@ def costs_invoice_attachment_view(request, year, invoice_id):
     if invoice.user_id != request.user.id and not request.user.has_perm('wwwapp.view_all_costs'):
         raise Http404
 
-    return sendfile(request, invoice.attachment.path)
-
+    internal_filename = os.path.basename(invoice.attachment.name)
+    _, extension = os.path.splitext(internal_filename)
+    attachment_filename = (
+        f'{invoice.internal_number}{extension}'
+        if invoice.internal_number
+        else internal_filename
+    )
+    return sendfile(
+        request,
+        invoice.attachment.path,
+        attachment_filename=attachment_filename,
+    )
 
 @login_required
 @permission_required('wwwapp.view_all_costs', raise_exception=True)
 def costs_admin_view(request, year):
     camp = get_object_or_404(Camp, pk=year)
-    users = User.objects.filter(invoices__camp=camp).distinct().order_by(
-        'first_name',
-        'last_name',
-        'pk',
+    invoices = Invoice.objects.filter(camp=camp).select_related('user').prefetch_related(
+        'cost_items__workshop'
     )
-    filter_form = CostFilterForm(request.GET or None, users=users)
-    invoices = Invoice.objects.filter(camp=camp).select_related('user').prefetch_related('cost_items')
-    if filter_form.is_valid():
-        filters = filter_form.cleaned_data
-        if filters['status']:
-            invoices = invoices.filter(status=filters['status'])
-        if filters['user']:
-            invoices = invoices.filter(user=filters['user'])
-        if filters['invoice_type']:
-            invoices = invoices.filter(invoice_type=filters['invoice_type'])
     context = {
         'title': 'Administracja kosztami',
         'selected_year': camp,
-        'filter_form': filter_form,
         'invoices': invoices.order_by('-created_at'),
         'can_approve_costs': request.user.has_perm('wwwapp.approve_costs'),
         'can_process_costs': request.user.has_perm('wwwapp.process_costs'),
@@ -471,6 +467,17 @@ def costs_statistics_view(request, year):
         }
         for value, label in CostItem.Category.choices
     ]
+    non_accounting_total = items.filter(
+        invoice__invoice_type=Invoice.Type.NON_ACCOUNTING_RECEIPT,
+    ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+    accounting_total = total - non_accounting_total
+    workshop_rows = list(
+        items.filter(workshop__isnull=False)
+        .values('workshop_id', 'workshop__title')
+        .annotate(total=Sum('amount'))
+        .exclude(total=Decimal('0.00'))
+        .order_by('-total', 'workshop__title', 'workshop_id')
+    )
     colors = ('#0072b2', '#e69f00', '#009e73', '#cc79a7', '#d55e00', '#56b4e9')
     start_angle = -90
     for row, color in zip(category_rows, colors):
@@ -486,6 +493,9 @@ def costs_statistics_view(request, year):
         'category_percentages': category_percentages,
         'category_rows': category_rows,
         'total': total,
+        'non_accounting_total': non_accounting_total,
+        'accounting_total': accounting_total,
+        'workshop_rows': workshop_rows,
         'has_statistics_data': bool(total),
     }
     return render(request, 'costs_statistics.html', context)
